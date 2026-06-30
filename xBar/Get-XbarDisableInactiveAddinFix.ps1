@@ -1,7 +1,7 @@
 # Get-XbarDisableInactiveAddinFix.ps1
 # Detects Office version, Xbar ProgID, and generates a .reg file with the needed changes
 # Run as the affected user - makes NO system changes
-# Admin rights are required to import the generated .reg file because HKCM is updated
+# Admin rights are NOT required to import the generated .reg file
 
 $knownProgIDs = @("InforCRMXbar", "Saleslogix.Outlook.Connector", "SaleslogixSidebar")
 
@@ -14,7 +14,6 @@ Write-Host "========================================" -ForegroundColor Cyan
 # Trust the highest version found under Outlook\Addins as the active one
 $detectedVersion = $null
 $detectedProgID  = $null
-$detectedHive    = $null
 
 $searchPaths = @(
     @{ Hive = "HKCU"; Root = "HKCU:\Software\Microsoft\Office" },
@@ -39,6 +38,7 @@ foreach ($entry in $searchPaths) {
 Write-Host "`n[Office Versions with Outlook Addins key]" -ForegroundColor Yellow
 if ($versionsFound.Count -eq 0) {
     Write-Host "  None found." -ForegroundColor Red
+    exit 1
 } else {
     foreach ($ver in ($versionsFound.Keys | Sort-Object -Descending)) {
         Write-Host "  $ver  ->  found in: $($versionsFound[$ver] -join ', ')"
@@ -51,40 +51,121 @@ if ($versionsFound.Count -eq 0) {
 Write-Host "`n[Searching for Xbar ProgID under version $detectedVersion]" -ForegroundColor Yellow
 
 $addinSearchPaths = @(
-    "HKCU:\Software\Microsoft\Office\$detectedVersion\Outlook\Addins",
-    "HKLM:\Software\Microsoft\Office\$detectedVersion\Outlook\Addins",
-    "HKLM:\Software\Wow6432Node\Microsoft\Office\$detectedVersion\Outlook\Addins"
+    @{ Path = "HKCU:\Software\Microsoft\Office\$detectedVersion\Outlook\Addins"; Hive = "HKCU" },
+    @{ Path = "HKLM:\Software\Microsoft\Office\$detectedVersion\Outlook\Addins"; Hive = "HKLM" },
+    @{ Path = "HKLM:\Software\Wow6432Node\Microsoft\Office\$detectedVersion\Outlook\Addins"; Hive = "HKLM (Wow6432Node)" }
 )
 
-foreach ($path in $addinSearchPaths) {
-    if (-not (Test-Path $path)) { continue }
-    Get-ChildItem $path -ErrorAction SilentlyContinue | ForEach-Object {
+# Collect all candidates across all hives before making any decision
+$candidates = @()
+
+foreach ($entry in $addinSearchPaths) {
+    if (-not (Test-Path $entry.Path)) { continue }
+    Get-ChildItem $entry.Path -ErrorAction SilentlyContinue | ForEach-Object {
         $progID = $_.PSChildName
         $lb     = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).LoadBehavior
         $isXbar = $knownProgIDs | Where-Object { $progID -like "*$_*" }
-        $tag    = if ($isXbar) { " <-- Xbar" } else { "" }
-        Write-Host "  $progID  |  LoadBehavior: $lb$tag" -ForegroundColor $(if ($isXbar) { "Green" } else { "White" })
-        if ($isXbar -and -not $detectedProgID) {
-            $detectedProgID = $progID
-            $detectedHive   = $path -replace '\\Software.*', ''
+
+        if (-not $isXbar) {
+            Write-Host "  $progID  |  $($entry.Hive)  |  LoadBehavior: $lb" -ForegroundColor White
+            return
+        }
+
+        # Resolve DLL path via HKCR: ProgID -> CLSID -> InprocServer32
+        $dllPath   = $null
+        $clsid     = $null
+        $dllStatus = "No CLSID found (deeply orphaned)"
+
+        $clsidKey = "Registry::HKEY_CLASSES_ROOT\$progID\CLSID"
+        if (Test-Path $clsidKey) {
+            $clsid = (Get-ItemProperty $clsidKey -ErrorAction SilentlyContinue).'(default)'
+        }
+
+        if ($clsid) {
+            $inprocKey = "Registry::HKEY_CLASSES_ROOT\CLSID\$clsid\InprocServer32"
+            if (Test-Path $inprocKey) {
+                $dllPath = (Get-ItemProperty $inprocKey -ErrorAction SilentlyContinue).'(default)'
+            }
+
+            if ($dllPath) {
+                if (Test-Path $dllPath) {
+                    $dllStatus = "DLL Found"
+                } else {
+                    $dllStatus = "DLL NOT found on disk (orphaned)"
+                }
+            } else {
+                $dllStatus = "CLSID found but no InprocServer32 path (orphaned)"
+            }
+        }
+
+        $candidates += [PSCustomObject]@{
+            ProgID       = $progID
+            Hive         = $entry.Hive
+            LoadBehavior = $lb
+            CLSID        = $clsid
+            DllPath      = $dllPath
+            DllStatus    = $dllStatus
+            DllExists    = ($dllPath -and (Test-Path $dllPath))
         }
     }
 }
 
-if (-not $detectedProgID) {
-    Write-Host "  No known Xbar ProgID found. Please check the list above and re-run with the correct ProgID." -ForegroundColor Red
+# Report all Xbar candidates found
+Write-Host "`n[Xbar ProgID Candidates]" -ForegroundColor Yellow
+if ($candidates.Count -eq 0) {
+    Write-Host "`n  ERROR: No Xbar add-in entries were found in the registry." -ForegroundColor Red
+    Write-Host "  The following ProgIDs were searched for:" -ForegroundColor Red
+    foreach ($id in $knownProgIDs) {
+        Write-Host "    - $id" -ForegroundColor Red
+    }
+    Write-Host "  Please escalate this output to your Infor CRM administrator." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "`n  --> ProgID: $detectedProgID" -ForegroundColor Green
+foreach ($c in $candidates) {
+    $color = if ($c.DllExists) { "Green" } else { "Red" }
+    Write-Host "  $($c.ProgID)  |  $($c.Hive)  |  LoadBehavior: $($c.LoadBehavior)  |  $($c.DllStatus)" -ForegroundColor $color
+    if ($c.DllPath) {
+        Write-Host "    DLL: $($c.DllPath)" -ForegroundColor $color
+    }
+}
+
+# Select active ProgID - must have exactly one with a DLL confirmed on disk
+$activeCandidates = $candidates | Where-Object { $_.DllExists }
+
+if ($activeCandidates.Count -eq 0) {
+    Write-Host "`n  ERROR: No Xbar ProgID could be confirmed with a DLL present on disk." -ForegroundColor Red
+    Write-Host "  The following ProgIDs were searched for:" -ForegroundColor Red
+    foreach ($id in $knownProgIDs) {
+        Write-Host "    - $id" -ForegroundColor Red
+    }
+    Write-Host "  Please escalate this output to your Infor CRM administrator." -ForegroundColor Red
+    exit 1
+}
+
+if ($activeCandidates.Count -gt 1) {
+    Write-Host "`n  ERROR: More than one Xbar ProgID was found with a DLL present on disk." -ForegroundColor Red
+    Write-Host "  The active installation is ambiguous. No .reg file will be generated." -ForegroundColor Red
+    Write-Host "  Please escalate this output to your Infor CRM administrator." -ForegroundColor Red
+    exit 1
+}
+
+$detectedProgID = $activeCandidates[0].ProgID
+Write-Host "`n  --> ProgID confirmed: $detectedProgID  |  $($activeCandidates[0].Hive)  |  $($activeCandidates[0].DllPath)" -ForegroundColor Green
 
 # --- Get Domain ---
+# Get-CimInstance is preferred in modern PowerShell but requires WS-Man which may
+# not be available or configured on older Windows 10 machines. Get-WmiObject is
+# used here intentionally for maximum compatibility.
 $domain = (Get-WmiObject Win32_ComputerSystem).Domain
 Write-Host "`n[Domain]" -ForegroundColor Yellow
 Write-Host "  $domain"
 
 # --- Generate .reg file ---
-# Convert HKCU/HKLM to reg file format (no colons, backslash paths)
+# Only HKCU entries are written. HKCU takes precedence over HKLM for LoadBehavior
+# and DoNotDisableAddinList is additive, so HKCU entries are sufficient to fix
+# the add-in for the current user regardless of whether Xbar was installed
+# machine-wide under HKLM. This avoids requiring admin rights to import the file.
 $regContent = @"
 Windows Registry Editor Version 5.00
 
@@ -100,24 +181,22 @@ Windows Registry Editor Version 5.00
 ; ============================================================
 
 ; --- HKCU: Prevent Office from disabling the add-in ---
+; HKCU takes precedence over HKLM for this key. Setting it here is
+; sufficient for the current user regardless of how Xbar was installed.
 [HKEY_CURRENT_USER\Software\Microsoft\Office\$detectedVersion\Outlook\Resiliency\DoNotDisableAddinList]
 "$detectedProgID"=dword:00000001
 
 ; --- HKCU: Set LoadBehavior to load at startup ---
+; NOTE: The Addins path intentionally does NOT include a version number.
+; Microsoft documentation and VSTO registry references confirm that LoadBehavior
+; is registered under Office\Outlook\Addins, not Office\<version>\Outlook\Addins.
+; See: https://learn.microsoft.com/en-us/visualstudio/vsto/registry-entries-for-vsto-add-ins
 [HKEY_CURRENT_USER\Software\Microsoft\Office\Outlook\Addins\$detectedProgID]
-"LoadBehavior"=dword:00000003
-
-; --- HKLM: Prevent Office from disabling the add-in (for locked-down accounts) ---
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Office\$detectedVersion\Outlook\Resiliency\DoNotDisableAddinList]
-"$detectedProgID"=dword:00000001
-
-; --- HKLM: Set LoadBehavior to load at startup (for locked-down accounts) ---
-[HKEY_LOCAL_MACHINE\Software\Microsoft\Office\Outlook\Addins\$detectedProgID]
 "LoadBehavior"=dword:00000003
 "@
 
-# --- Find a writable output location (hidden from casual view) ---
-$candidates = @(
+# --- Find a writable output location ---
+$outputCandidates = @(
     "$env:TEMP",
     "$env:USERPROFILE\Downloads",
     "$env:LOCALAPPDATA\Temp",
@@ -126,9 +205,8 @@ $candidates = @(
 )
 
 $outputDir = $null
-foreach ($candidate in $candidates) {
+foreach ($candidate in $outputCandidates) {
     if (Test-Path $candidate) {
-        # Verify we can actually write there
         $testFile = Join-Path $candidate "xbar_write_test.tmp"
         try {
             [IO.File]::WriteAllText($testFile, "test")
@@ -151,6 +229,6 @@ $regContent | Out-File -FilePath $outputPath -Encoding ASCII
 
 Write-Host "`n[Output]" -ForegroundColor Yellow
 Write-Host "  .reg file saved to: $outputPath" -ForegroundColor Green
-Write-Host "  Review it, then double-click to apply (requires admin for HKLM entries)."
+Write-Host "  Double-click the file to apply, or run: regedit /s Fix-XbarAddin.reg"
 Write-Host ""
 Write-Host "========================================`n" -ForegroundColor Cyan
