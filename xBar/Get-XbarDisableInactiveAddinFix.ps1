@@ -12,6 +12,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 
 # --- Detect Office Version ---
 # Trust the highest version found under Outlook\Addins as the active one
+# (this will be verified against the actual installed Outlook.exe below)
 $detectedVersion = $null
 $detectedProgID  = $null
 
@@ -46,6 +47,55 @@ if ($versionsFound.Count -eq 0) {
     $detectedVersion = ($versionsFound.Keys | Sort-Object -Descending | Select-Object -First 1)
     Write-Host "  --> Using version: $detectedVersion" -ForegroundColor Green
 }
+
+# --- Verify Office version against the actual installed OUTLOOK.EXE ---
+# Office uses a shared registry version number (e.g. 16.0 covers Office 2016,
+# 2019, 2021, 2024, and Microsoft 365 - they are differentiated by build number,
+# not the major version folder). So we only verify the MAJOR version number
+# matches the actual installed Outlook.exe, not an exact build match.
+# Bitness is also determined directly from the real install path rather than
+# assumed, since both 32-bit and 64-bit Outlook can exist on a 64-bit OS.
+Write-Host "`n[Verifying against actual installed Outlook.exe]" -ForegroundColor Yellow
+
+$appPathKey = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE"
+
+if (-not (Test-Path $appPathKey)) {
+    Write-Host "`n  ERROR: Could not locate OUTLOOK.EXE registration at:" -ForegroundColor Red
+    Write-Host "    $appPathKey" -ForegroundColor Red
+    Write-Host "  Cannot verify the registry-detected Office version is correct." -ForegroundColor Red
+    Write-Host "  Please escalate this output to your Infor CRM administrator." -ForegroundColor Red
+    exit 1
+}
+
+$outlookExePath = (Get-ItemProperty -Path $appPathKey -ErrorAction SilentlyContinue).'(default)'
+
+if (-not $outlookExePath -or -not (Test-Path $outlookExePath)) {
+    Write-Host "`n  ERROR: OUTLOOK.EXE path registered but not found on disk." -ForegroundColor Red
+    Write-Host "    Registered Path : $outlookExePath" -ForegroundColor Red
+    Write-Host "  Please escalate this output to your Infor CRM administrator." -ForegroundColor Red
+    exit 1
+}
+
+$outlookFileVersion = (Get-Item $outlookExePath).VersionInfo.ProductVersion
+$outlookMajorVersion = ($outlookFileVersion -split '\.')[0] + ".0"
+
+$detectedBitness = if ($outlookExePath -match '\\Program Files \(x86\)\\') { "32-bit" } else { "64-bit" }
+
+Write-Host "  Outlook.exe Path    : $outlookExePath"
+Write-Host "  Outlook File Version: $outlookFileVersion"
+Write-Host "  Outlook Bitness     : $detectedBitness"
+Write-Host "  Registry Version    : $detectedVersion"
+
+if ($outlookMajorVersion -ne $detectedVersion) {
+    Write-Host "`n  ERROR: Registry-detected Office version does not match the actual installed Outlook." -ForegroundColor Red
+    Write-Host "    Registry Version     : $detectedVersion" -ForegroundColor Red
+    Write-Host "    Outlook.exe Path     : $outlookExePath" -ForegroundColor Red
+    Write-Host "    Outlook.exe Version  : $outlookFileVersion" -ForegroundColor Red
+    Write-Host "  No .reg file will be generated. Please escalate this output to your Infor CRM administrator." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "  --> Version confirmed against installed Outlook.exe" -ForegroundColor Green
 
 # --- Find Xbar ProgID ---
 # NOTE on 32-bit/64-bit coverage:
@@ -198,6 +248,7 @@ Windows Registry Editor Version 5.00
 ; ============================================================
 ; Xbar Outlook Add-in Fix
 ; Office Version : $detectedVersion
+; Outlook Bitness: $detectedBitness
 ; ProgID         : $detectedProgID
 ; Domain         : $domain
 ; Generated      : $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
