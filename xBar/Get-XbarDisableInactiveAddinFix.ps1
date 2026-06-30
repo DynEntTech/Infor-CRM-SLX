@@ -48,6 +48,11 @@ if ($versionsFound.Count -eq 0) {
 }
 
 # --- Find Xbar ProgID ---
+# NOTE on 32-bit/64-bit coverage:
+# HKCU is NOT subject to Wow6432Node redirection - 32-bit and 64-bit processes
+# share the same HKCU hive, so no separate HKCU Wow6432Node path is needed.
+# HKLM:\Software\Wow6432Node covers 32-bit add-ins registered machine-wide on
+# a 64-bit OS, and is included below alongside the native HKLM path.
 Write-Host "`n[Searching for Xbar ProgID under version $detectedVersion]" -ForegroundColor Yellow
 
 $addinSearchPaths = @(
@@ -72,19 +77,36 @@ foreach ($entry in $addinSearchPaths) {
         }
 
         # Resolve DLL path via HKCR: ProgID -> CLSID -> InprocServer32
+        # Check both the native CLSID location and the Wow6432Node location,
+        # since a 32-bit add-in's CLSID may be registered under either
+        # depending on OS/Office bitness combination.
         $dllPath   = $null
         $clsid     = $null
         $dllStatus = "No CLSID found (deeply orphaned)"
 
-        $clsidKey = "Registry::HKEY_CLASSES_ROOT\$progID\CLSID"
-        if (Test-Path $clsidKey) {
-            $clsid = (Get-ItemProperty $clsidKey -ErrorAction SilentlyContinue).'(default)'
+        $clsidSearchKeys = @(
+            "Registry::HKEY_CLASSES_ROOT\$progID\CLSID",
+            "Registry::HKEY_CLASSES_ROOT\Wow6432Node\$progID\CLSID"
+        )
+
+        foreach ($clsidKey in $clsidSearchKeys) {
+            if (Test-Path $clsidKey) {
+                $clsid = (Get-ItemProperty $clsidKey -ErrorAction SilentlyContinue).'(default)'
+                if ($clsid) { break }
+            }
         }
 
         if ($clsid) {
-            $inprocKey = "Registry::HKEY_CLASSES_ROOT\CLSID\$clsid\InprocServer32"
-            if (Test-Path $inprocKey) {
-                $dllPath = (Get-ItemProperty $inprocKey -ErrorAction SilentlyContinue).'(default)'
+            $inprocSearchKeys = @(
+                "Registry::HKEY_CLASSES_ROOT\CLSID\$clsid\InprocServer32",
+                "Registry::HKEY_CLASSES_ROOT\Wow6432Node\CLSID\$clsid\InprocServer32"
+            )
+
+            foreach ($inprocKey in $inprocSearchKeys) {
+                if (Test-Path $inprocKey) {
+                    $dllPath = (Get-ItemProperty $inprocKey -ErrorAction SilentlyContinue).'(default)'
+                    if ($dllPath) { break }
+                }
             }
 
             if ($dllPath) {
@@ -126,7 +148,11 @@ foreach ($c in $candidates) {
     $color = if ($c.DllExists) { "Green" } else { "Red" }
     Write-Host "  $($c.ProgID)  |  $($c.Hive)  |  LoadBehavior: $($c.LoadBehavior)  |  $($c.DllStatus)" -ForegroundColor $color
     if ($c.DllPath) {
-        Write-Host "    DLL: $($c.DllPath)" -ForegroundColor $color
+        Write-Host "    DLL Path : $($c.DllPath)" -ForegroundColor $color
+        Write-Host "    DLL Found: $($c.DllExists)" -ForegroundColor $color
+    } else {
+        Write-Host "    DLL Path : Not resolved" -ForegroundColor Red
+        Write-Host "    DLL Found: False" -ForegroundColor Red
     }
 }
 
