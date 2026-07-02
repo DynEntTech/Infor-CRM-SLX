@@ -1,7 +1,7 @@
 # Get-XbarDisableInactiveAddinFix.ps1
 # Detects Office version, Xbar ProgID, and generates a .reg file with the needed changes
 # Run as the affected user - makes NO system changes
-# Admin rights are NOT required to import the generated .reg file
+# Admin rights ARE required to import the generated .reg file because HKLM is updated
 
 $knownProgIDs = @("InforCRMXbar", "Saleslogix.Outlook.Connector", "SaleslogixSidebar")
 
@@ -238,10 +238,9 @@ Write-Host "`n[Domain]" -ForegroundColor Yellow
 Write-Host "  $domain"
 
 # --- Generate .reg file ---
-# Only HKCU entries are written. HKCU takes precedence over HKLM for LoadBehavior
-# and DoNotDisableAddinList is additive, so HKCU entries are sufficient to fix
-# the add-in for the current user regardless of whether Xbar was installed
-# machine-wide under HKLM. This avoids requiring admin rights to import the file.
+# Both HKCU and HKLM entries are written. Outlook checks both hives for the
+# DoNotDisableAddinList and both must be present for full protection against
+# the add-in being disabled. HKLM entries require admin rights to import.
 $regContent = @"
 Windows Registry Editor Version 5.00
 
@@ -258,8 +257,7 @@ Windows Registry Editor Version 5.00
 ; ============================================================
 
 ; --- HKCU: Prevent Office from disabling the add-in ---
-; HKCU takes precedence over HKLM for this key. Setting it here is
-; sufficient for the current user regardless of how Xbar was installed.
+; HKCU entry is required - Outlook checks both HKCU and HKLM for this list.
 [HKEY_CURRENT_USER\Software\Microsoft\Office\$detectedVersion\Outlook\Resiliency\DoNotDisableAddinList]
 "$detectedProgID"=dword:00000001
 
@@ -269,6 +267,24 @@ Windows Registry Editor Version 5.00
 ; is registered under Office\Outlook\Addins, not Office\<version>\Outlook\Addins.
 ; See: https://learn.microsoft.com/en-us/visualstudio/vsto/registry-entries-for-vsto-add-ins
 [HKEY_CURRENT_USER\Software\Microsoft\Office\Outlook\Addins\$detectedProgID]
+"LoadBehavior"=dword:00000003
+
+; ============================================================
+; *** IMPORTANT: The entries below require administrator rights.
+; If you do not have admin rights, provide this file to your
+; IT administrator to apply on your behalf.
+; ============================================================
+
+; --- HKLM: Prevent Office from disabling the add-in ---
+; HKLM entry is required - Outlook checks both HKCU and HKLM for this list.
+; Both must be present for full protection against the add-in being disabled.
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Office\$detectedVersion\Outlook\Resiliency\DoNotDisableAddinList]
+"$detectedProgID"=dword:00000001
+
+; --- HKLM: Set LoadBehavior to load at startup ---
+; NOTE: Same as HKCU above -- no version number in this path by design.
+; See: https://learn.microsoft.com/en-us/previous-versions/troubleshoot/outlook/addins-are-registered-under-wow6432node
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Office\Outlook\Addins\$detectedProgID]
 "LoadBehavior"=dword:00000003
 "@
 
@@ -306,6 +322,14 @@ $regContent | Out-File -FilePath $outputPath -Encoding ASCII
 
 Write-Host "`n[Output]" -ForegroundColor Yellow
 Write-Host "  .reg file saved to: $outputPath" -ForegroundColor Green
+Write-Host ""
+Write-Host "  *** IMPORTANT ***" -ForegroundColor Yellow
+Write-Host "  This .reg file contains both HKCU and HKLM entries." -ForegroundColor Yellow
+Write-Host "  HKCU entries will apply for the current user without elevation." -ForegroundColor Yellow
+Write-Host "  HKLM entries require administrator rights to apply." -ForegroundColor Yellow
+Write-Host "  Please provide this file to your IT administrator if you" -ForegroundColor Yellow
+Write-Host "  do not have administrator rights on this machine." -ForegroundColor Yellow
+Write-Host ""
 Write-Host "  Double-click the file to apply, or run: regedit /s Fix-XbarAddin.reg"
 Write-Host ""
 Write-Host "========================================`n" -ForegroundColor Cyan
