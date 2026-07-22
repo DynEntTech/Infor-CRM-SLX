@@ -237,6 +237,79 @@ $domain = (Get-WmiObject Win32_ComputerSystem).Domain
 Write-Host "`n[Domain]" -ForegroundColor Yellow
 Write-Host "  $domain"
 
+# --- Check Current State of Target Keys/Values ---
+# Reads the four values the .reg file is about to set, so the tech can see
+# up front what will actually change vs. what is already correct. This does
+# NOT modify anything - read-only.
+Write-Host "`n[Checking current state of target registry values]" -ForegroundColor Yellow
+
+$desiredDoNotDisable = 1
+$desiredLoadBehavior = 3
+
+function Get-RegDwordValue {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+    if (-not (Test-Path $Path)) {
+        return [PSCustomObject]@{ Exists = $false; Value = $null }
+    }
+    $item = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+    if ($null -eq $item -or $null -eq $item.$Name) {
+        return [PSCustomObject]@{ Exists = $false; Value = $null }
+    }
+    return [PSCustomObject]@{ Exists = $true; Value = $item.$Name }
+}
+
+$checks = @(
+    [PSCustomObject]@{
+        Label    = "HKCU DoNotDisableAddinList\$detectedProgID"
+        Path     = "HKCU:\Software\Microsoft\Office\$detectedVersion\Outlook\Resiliency\DoNotDisableAddinList"
+        Name     = $detectedProgID
+        Desired  = $desiredDoNotDisable
+    },
+    [PSCustomObject]@{
+        Label    = "HKLM DoNotDisableAddinList\$detectedProgID"
+        Path     = "HKLM:\Software\Microsoft\Office\$detectedVersion\Outlook\Resiliency\DoNotDisableAddinList"
+        Name     = $detectedProgID
+        Desired  = $desiredDoNotDisable
+    },
+    [PSCustomObject]@{
+        Label    = "HKCU Outlook\Addins\$detectedProgID  LoadBehavior"
+        Path     = "HKCU:\Software\Microsoft\Office\Outlook\Addins\$detectedProgID"
+        Name     = "LoadBehavior"
+        Desired  = $desiredLoadBehavior
+    },
+    [PSCustomObject]@{
+        Label    = "HKLM Outlook\Addins\$detectedProgID  LoadBehavior"
+        Path     = "HKLM:\Software\Microsoft\Office\Outlook\Addins\$detectedProgID"
+        Name     = "LoadBehavior"
+        Desired  = $desiredLoadBehavior
+    }
+)
+
+$anyChangeNeeded = $false
+
+foreach ($check in $checks) {
+    $result = Get-RegDwordValue -Path $check.Path -Name $check.Name
+
+    if (-not $result.Exists) {
+        Write-Host "  [MISSING]      $($check.Label)  (not set; will be created as $($check.Desired))" -ForegroundColor Red
+        $anyChangeNeeded = $true
+    } elseif ($result.Value -eq $check.Desired) {
+        Write-Host "  [ALREADY OK]   $($check.Label)  = $($result.Value)" -ForegroundColor Green
+    } else {
+        Write-Host "  [WILL CHANGE]  $($check.Label)  currently $($result.Value)  ->  will be set to $($check.Desired)" -ForegroundColor Red
+        $anyChangeNeeded = $true
+    }
+}
+
+if ($anyChangeNeeded) {
+    Write-Host "`n  --> At least one value differs from the desired state. A .reg file with the necessary fixes will be generated below." -ForegroundColor Yellow
+} else {
+    Write-Host "`n  --> All target values already match the desired state. A .reg file will still be generated (harmless to reapply), but importing it should make no changes." -ForegroundColor Green
+}
+
 # --- Generate .reg file ---
 # Both HKCU and HKLM entries are written. Outlook checks both hives for the
 # DoNotDisableAddinList and both must be present for full protection against
